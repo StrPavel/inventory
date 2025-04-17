@@ -8,19 +8,20 @@ import time
 from flask import Flask, request, jsonify
 from werkzeug.utils import secure_filename
 from tensorflow.keras.models import load_model
-from functools import lru_cache
 import logging
 from pathlib import Path
 import tensorflow as tf
 from datetime import datetime
-import shutil
 from contextlib import contextmanager
+import requests
+import tarfile
+import gdown
 
 # ==============================================
 # НАСТРОЙКИ И КОНФИГУРАЦИЯ
 # ==============================================
 
-# Настройка логирования с поддержкой Unicode
+# Настройка логирования
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -31,30 +32,29 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Настройки базы данных
-SQLITE_TIMEOUT = 15  # секунд
-MAX_RETRIES = 5
-RETRY_DELAY = 0.2  # секунд
-
 app = Flask(__name__)
 
 # Конфигурация путей
 BASE_DIR = Path(__file__).parent.absolute()
-PROJECT_ROOT = Path("C:/my_project2")
-CLASSES_DIR = PROJECT_ROOT / "classes"
-MODELS_DIR = PROJECT_ROOT / "Keras"
-LEARNING_DIR = PROJECT_ROOT / "alcogole"
-DATABASE_PATH = BASE_DIR / "bottle.db"
+CLASSES_DIR = BASE_DIR / "classes"
+MODELS_DIR = BASE_DIR / "models"
 UPLOAD_FOLDER = BASE_DIR / "uploads"
 BRAND_PHOTOS_DIR = UPLOAD_FOLDER / "brand_photos"
+DATABASE_PATH = BASE_DIR / "bottle.db"
 
 # Создание необходимых папок
 os.makedirs(CLASSES_DIR, exist_ok=True)
+os.makedirs(MODELS_DIR, exist_ok=True)
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(BRAND_PHOTOS_DIR, exist_ok=True)
 
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16 MB
+
+# Настройки базы данных
+SQLITE_TIMEOUT = 15  # секунд
+MAX_RETRIES = 5
+RETRY_DELAY = 0.2  # секунд
 
 # ==============================================
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
@@ -75,9 +75,9 @@ def get_db():
             conn = sqlite3.connect(
                 DATABASE_PATH, 
                 timeout=SQLITE_TIMEOUT,
-                isolation_level=None  # Для ручного управления транзакциями
+                isolation_level=None
             )
-            conn.execute("PRAGMA journal_mode=WAL")  # Режим записи журнала
+            conn.execute("PRAGMA journal_mode=WAL")
             conn.row_factory = sqlite3.Row
             
             try:
@@ -126,11 +126,9 @@ def init_db():
     """Инициализация базы данных"""
     try:
         with get_db() as conn:
-            # Включаем WAL режим для лучшей производительности
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
             
-            # Основная таблица типов алкоголя
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS alcohol_types (
                     name TEXT PRIMARY KEY,
@@ -139,7 +137,6 @@ def init_db():
                 )
             ''')
             
-            # Таблица блокировок для отладки
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS db_locks (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -165,10 +162,36 @@ class ModelManager:
     """Класс для управления загрузкой и использованием моделей ИИ"""
     def __init__(self):
         self.models = {}
+        self.download_models()
         self.load_all_models()
 
+    def download_models(self):
+        """Загружает модели из Google Drive или другого источника"""
+        try:
+            if not os.path.exists(MODELS_DIR / "gin.keras"):
+                logger.info("Начало загрузки моделей...")
+                
+                # URL для загрузки моделей (можно заменить на свой)
+                model_urls = {
+                    'gin': 'https://drive.google.com/uc?id=YOUR_GIN_MODEL_ID',
+                    'vodka': 'https://drive.google.com/uc?id=YOUR_VODKA_MODEL_ID',
+                    'whiskey': 'https://drive.google.com/uc?id=YOUR_WHISKEY_MODEL_ID'
+                }
+                
+                for model_name, url in model_urls.items():
+                    output_path = MODELS_DIR / f"{model_name}.keras"
+                    if not output_path.exists():
+                        logger.info(f"Загрузка модели {model_name}...")
+                        gdown.download(url, str(output_path), quiet=False)
+                        logger.info(f"Модель {model_name} загружена")
+                
+                logger.info("Все модели успешно загружены")
+        except Exception as e:
+            logger.error(f"Ошибка загрузки моделей: {e}")
+            raise
+
     def load_all_models(self):
-        """Предварительно загружает все модели при инициализации"""
+        """Загружает все доступные модели"""
         logger.info("Начало загрузки всех моделей ИИ...")
         
         model_files = list(MODELS_DIR.glob("*.keras"))
@@ -181,7 +204,6 @@ class ModelManager:
                 logger.info(f"Загрузка модели для {alcohol_type}...")
                 self.models[alcohol_type] = load_model(model_file)
                 
-                # Проверка загрузки
                 input_shape = self.models[alcohol_type].input_shape
                 output_shape = self.models[alcohol_type].output_shape
                 logger.info(
@@ -193,7 +215,7 @@ class ModelManager:
                 raise
 
     def get_model(self, alcohol_type):
-        """Возвращает предзагруженную модель по типу алкоголя"""
+        """Возвращает модель по типу алкоголя"""
         model = self.models.get(alcohol_type.lower())
         if model is None:
             available = list(self.models.keys())
@@ -207,12 +229,8 @@ class PhotoManager:
     """Класс для управления сохранением фотографий"""
     @staticmethod
     def save_brand_photo(file, brand, bottle_volume, remaining_volume):
-        """
-        Сохраняет фотографию бутылки с указанием бренда и объема
-        Формат имени файла: {дата}_{время}_{бренд}_{объем}ml_{осталось}ml_{ориг_имя}
-        """
+        """Сохраняет фотографию бутылки с метаданными"""
         try:
-            # Валидация параметров
             if not file or file.filename == '':
                 raise ValueError("Неверный файл изображения")
             
@@ -227,7 +245,6 @@ class PhotoManager:
             except (ValueError, TypeError):
                 raise ValueError("Неверный формат объема")
 
-            # Подготовка имени файла
             safe_brand = re.sub(r'[^\w-]', '_', brand.strip())
             brand_dir = BRAND_PHOTOS_DIR / safe_brand
             os.makedirs(brand_dir, exist_ok=True)
@@ -244,7 +261,6 @@ class PhotoManager:
                 f"{name.replace(' ', '_')}{ext}"
             )
             
-            # Сохранение файла
             file_path = brand_dir / new_filename
             file.save(file_path)
             
@@ -260,9 +276,9 @@ class PhotoManager:
 # ==============================================
 
 def load_alcohol_classes():
-    """Загружает классы алкоголя из текстовых файлов с валидацией"""
+    """Загружает классы алкоголя из текстовых файлов"""
     classes = {}
-    expected_counts = {'gin': 60}  # Ожидаемое количество брендов для каждого типа
+    expected_counts = {'gin': 60}  # Ожидаемое количество брендов
     
     try:
         logger.info(f"Загрузка классов алкоголя из: {CLASSES_DIR}")
@@ -283,7 +299,7 @@ def load_alcohol_classes():
                     for line in f:
                         line_num += 1
                         brand = line.strip()
-                        if brand:  # Пропускаем пустые строки
+                        if brand:
                             if brand in brands:
                                 logger.warning(
                                     f"Дубликат бренда '{brand}' в строке {line_num} "
@@ -299,7 +315,6 @@ def load_alcohol_classes():
                     classes[alcohol_type] = brands
                     count = len(brands)
                     
-                    # Проверяем ожидаемое количество брендов
                     if alcohol_type in expected_counts:
                         expected = expected_counts[alcohol_type]
                         if count != expected:
@@ -308,9 +323,7 @@ def load_alcohol_classes():
                                 f"ожидалось {expected}. Проверьте файл {filename}"
                             )
                     
-                    logger.info(
-                        f"Загружено {count} брендов для {alcohol_type} из {filename}"
-                    )
+                    logger.info(f"Загружено {count} брендов для {alcohol_type} из {filename}")
         
         if not classes:
             raise ValueError("Не найдено ни одного валидного класса алкоголя")
@@ -327,7 +340,6 @@ def get_or_create_table(alcohol_type):
         table_name = f"alc_{sanitize_table_name(alcohol_type)}"
         
         with get_db() as conn:
-            # Проверяем существование таблицы
             cursor = conn.execute('''
                 SELECT name FROM sqlite_master 
                 WHERE type='table' AND name=?
@@ -336,7 +348,6 @@ def get_or_create_table(alcohol_type):
             if not cursor.fetchone():
                 logger.info(f"Создаем таблицу {table_name} для {alcohol_type}")
                 
-                # Логируем создание таблицы
                 conn.execute('''
                     INSERT INTO db_locks (table_name, process_info)
                     VALUES (?, ?)
@@ -356,7 +367,6 @@ def get_or_create_table(alcohol_type):
                     )
                 ''')
                 
-                # Создаем индексы для ускорения поиска
                 conn.execute(f'''
                     CREATE INDEX idx_{table_name}_brand 
                     ON "{table_name}" (brand)
@@ -381,17 +391,12 @@ def get_or_create_table(alcohol_type):
         logger.error(f"Ошибка создания таблицы {alcohol_type}: {e}", exc_info=True)
         raise
 
-# ==============================================
-# ОСНОВНЫЕ ФУНКЦИИ ОБРАБОТКИ
-# ==============================================
-
 def predict_with_filter(image_path, alcohol_type, model_manager, enabled_brands=None):
     """Предсказание бренда с обработкой изображения"""
     try:
         alcohol_type = alcohol_type.lower()
         logger.info(f"Начало предсказания для: {alcohol_type}")
 
-        # Проверка доступности типа алкоголя
         if alcohol_type not in ALCOHOL_CLASSES:
             available_types = list(ALCOHOL_CLASSES.keys())
             raise ValueError(
@@ -401,7 +406,6 @@ def predict_with_filter(image_path, alcohol_type, model_manager, enabled_brands=
 
         all_brands = ALCOHOL_CLASSES[alcohol_type]
 
-        # Фильтрация брендов если указаны enabled_brands
         if enabled_brands:
             if not isinstance(enabled_brands, list):
                 raise ValueError("enabled_brands должен быть списком")
@@ -419,36 +423,29 @@ def predict_with_filter(image_path, alcohol_type, model_manager, enabled_brands=
 
         logger.debug(f"Используемые бренды ({len(brands)}): {brands}")
 
-        # Получаем модель для предсказания
         model = model_manager.get_model(alcohol_type)
 
-        # Загрузка и предобработка изображения
         img = cv2.imread(str(image_path))
         if img is None:
             raise ValueError("Не удалось прочитать изображение")
 
-        # Обработка оригинального изображения
         img_original = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         img_original = cv2.resize(img_original, (224, 224))
         img_original = img_original.astype('float32') / 255.0
         img_original = np.expand_dims(img_original, axis=0)
 
-        # Обработка центральной части изображения
         cropped = tf.image.central_crop(img, 0.7)
         img_detail = tf.image.resize(cropped, (224, 224)).numpy()
         img_detail = cv2.cvtColor(img_detail, cv2.COLOR_BGR2RGB)
         img_detail = img_detail.astype('float32') / 255.0
         img_detail = np.expand_dims(img_detail, axis=0)
 
-        # Предсказание модели
         model_input = [img_original, img_detail]
         predictions = model.predict(model_input, verbose=0)[0]
 
-        # Фильтрация и нормализация предсказаний
         filtered_predictions = predictions[brand_indices]
         filtered_predictions = filtered_predictions / np.sum(filtered_predictions)
 
-        # Получение топ-2 результатов
         top_indices = np.argpartition(filtered_predictions, -2)[-2:]
         top_indices = top_indices[np.argsort(filtered_predictions[top_indices])][::-1]
 
@@ -473,20 +470,13 @@ def predict_with_filter(image_path, alcohol_type, model_manager, enabled_brands=
         raise ValueError(f"Ошибка при обработке: {str(e)}") from e
 
 def ensure_class_folders():
-    """Создает папки классов для каждого типа алкоголя, если их нет"""
+    """Создает папки классов для каждого типа алкоголя"""
     try:
         for alcohol_type in ALCOHOL_CLASSES.keys():
-            learning_path = LEARNING_DIR / alcohol_type.capitalize() / "learning"
-            os.makedirs(learning_path, exist_ok=True)
-            
             class_file = CLASSES_DIR / f"{alcohol_type}.txt"
             if not class_file.exists():
                 with open(class_file, 'w', encoding='utf-8') as f:
                     logger.info(f"Создан пустой файл классов для {alcohol_type}")
-                
-                for brand in ALCOHOL_CLASSES[alcohol_type]:
-                    brand_path = learning_path / brand
-                    os.makedirs(brand_path, exist_ok=True)
     except Exception as e:
         logger.error(f"Ошибка создания папок классов: {e}")
         raise
@@ -501,7 +491,7 @@ def index():
     return jsonify({
         "status": "работает",
         "доступные_типы": list(ALCOHOL_CLASSES.keys()),
-        "версия": "1.1.0",
+        "версия": "2.0.0",
         "модели_загружены": len(app.model_manager.models)
     })
 
@@ -510,7 +500,6 @@ def predict():
     """Обработка изображения и предсказание бренда"""
     filepath = None
     try:
-        # Проверка наличия файла
         if 'file' not in request.files:
             raise ValueError("Не предоставлен файл изображения")
             
@@ -518,14 +507,12 @@ def predict():
         if file.filename == '':
             raise ValueError("Пустой файл")
         
-        # Получение параметров
         alcohol_type = request.form.get('alcohol_type', '').strip().lower()
         if not alcohol_type:
             raise ValueError("Не указан тип алкоголя (alcohol_type)")
         
         logger.debug(f"Получен запрос: тип={alcohol_type}, файл={file.filename}")
         
-        # Проверка поддерживаемого типа алкоголя
         if alcohol_type not in ALCOHOL_CLASSES:
             available_types = list(ALCOHOL_CLASSES.keys())
             raise ValueError(
@@ -533,7 +520,6 @@ def predict():
                 f"Доступные типы: {', '.join(available_types)}"
             )
 
-        # Обработка фильтра брендов
         enabled_brands = []
         if 'enabled_brands' in request.form:
             try:
@@ -543,12 +529,10 @@ def predict():
             except json.JSONDecodeError:
                 raise ValueError("Неверный формат enabled_brands")
         
-        # Сохранение временного файла
         filename = secure_filename(file.filename)
         filepath = UPLOAD_FOLDER / filename
         file.save(filepath)
         
-        # Предсказание бренда
         result = predict_with_filter(filepath, alcohol_type, app.model_manager, enabled_brands)
         
         return jsonify({
@@ -563,7 +547,6 @@ def predict():
             "available_types": list(ALCOHOL_CLASSES.keys())
         }), 400
     finally:
-        # Удаление временного файла
         if filepath and os.path.exists(filepath):
             try:
                 os.remove(filepath)
@@ -595,12 +578,10 @@ def get_brands():
 def find_bottle():
     """Поиск информации о бутылке в базе данных"""
     try:
-        # Получение параметров
         alcohol_type = request.args.get('type', '').strip()
         brand = request.args.get('brand', '').strip()
         volume = request.args.get('volume', '0').strip()
         
-        # Валидация параметров
         if not alcohol_type:
             raise ValueError("Тип алкоголя обязателен")
         if not brand:
@@ -612,11 +593,9 @@ def find_bottle():
         except ValueError:
             raise ValueError("Неверный формат объема")
 
-        # Получение или создание таблицы для типа алкоголя
         table_name = get_or_create_table(alcohol_type)
         
         with get_db() as conn:
-            # Поиск бутылки в базе данных
             cursor = conn.execute(f'''
                 SELECT * FROM "{table_name}"
                 WHERE brand = ? AND bottle_volume = ?
@@ -630,7 +609,6 @@ def find_bottle():
                     "data": dict(bottle)
                 })
             
-            # Если бутылка не найдена, возвращаем шаблон для добавления
             return jsonify({
                 "status": "not_found",
                 "template": {
@@ -661,13 +639,11 @@ def add_bottle():
     try:
         data = request.get_json()
         
-        # Проверка обязательных полей
         required = ['type_alcohol', 'brand', 'bottle_volume', 'bottle_weight']
         if not all(field in data for field in required):
             missing = [f for f in required if f not in data]
             raise ValueError(f"Не хватает обязательных полей: {missing}")
         
-        # Валидация данных
         alcohol_type = data['type_alcohol'].strip()
         brand = data['brand'].strip()
         try:
@@ -678,11 +654,9 @@ def add_bottle():
         except (ValueError, TypeError):
             raise ValueError("Неверный формат числовых полей")
 
-        # Получение или создание таблицы
         table_name = get_or_create_table(alcohol_type)
         
         with get_db() as conn:
-            # Проверка существования бутылки
             cursor = conn.execute(f'''
                 SELECT 1 FROM "{table_name}"
                 WHERE brand = ? AND bottle_volume = ?
@@ -693,7 +667,6 @@ def add_bottle():
                     "error": "Бутылка с такими параметрами уже существует"
                 }), 400
             
-            # Добавление новой бутылки
             cursor = conn.execute(f'''
                 INSERT INTO "{table_name}"
                 (type_alcohol, brand, bottle_volume, bottle_weight)
@@ -739,13 +712,11 @@ def calibrate_bottle(alcohol_type, bottle_id):
     try:
         data = request.get_json()
         
-        # Проверка обязательных полей
         required = ['added_ml', 'current_weight']
         if not all(field in data for field in required):
             missing = [f for f in required if f not in data]
             raise ValueError(f"Не хватает обязательных полей: {missing}")
         
-        # Валидация данных
         try:
             added_ml = float(data['added_ml'])
             current_weight = float(data['current_weight'])
@@ -754,11 +725,9 @@ def calibrate_bottle(alcohol_type, bottle_id):
         except (ValueError, TypeError):
             raise ValueError("Неверный формат числовых полей")
 
-        # Получение таблицы
         table_name = get_or_create_table(alcohol_type)
         
         with get_db() as conn:
-            # Получение данных о бутылке
             cursor = conn.execute(f'''
                 SELECT bottle_weight FROM "{table_name}"
                 WHERE id = ?
@@ -768,12 +737,10 @@ def calibrate_bottle(alcohol_type, bottle_id):
             if not bottle:
                 raise ValueError("Бутылка не найдена")
             
-            # Расчет веса алкоголя на мл
             empty_weight = bottle['bottle_weight']
             alcohol_weight = (current_weight - empty_weight) / added_ml
             alcohol_weight = round(alcohol_weight, 4)
             
-            # Обновление данных бутылки
             conn.execute(f'''
                 UPDATE "{table_name}"
                 SET alcohol_weight_per_ml = ?,
@@ -804,22 +771,18 @@ def calculate_volume():
     try:
         data = request.get_json()
         
-        # Проверка обязательных полей
         required = ['alcohol_type', 'bottle_id', 'current_weight']
         if not all(field in data for field in required):
             missing = [f for f in required if f not in data]
             raise ValueError(f"Не хватает обязательных полей: {missing}")
         
-        # Получение параметров
         alcohol_type = data['alcohol_type'].strip()
         bottle_id = data['bottle_id']
         current_weight = float(data['current_weight'])
         
-        # Получение таблицы
         table_name = get_or_create_table(alcohol_type)
         
         with get_db() as conn:
-            # Получение данных о бутылке
             cursor = conn.execute(f'''
                 SELECT bottle_weight, alcohol_weight_per_ml, bottle_volume 
                 FROM "{table_name}"
@@ -830,11 +793,9 @@ def calculate_volume():
             if not bottle:
                 raise ValueError("Бутылка не найдена")
             
-            # Проверка калибровки
             if not bottle['alcohol_weight_per_ml']:
                 raise ValueError("Бутылка не откалибрована")
             
-            # Расчет остатка
             empty_weight = bottle['bottle_weight']
             weight_per_ml = bottle['alcohol_weight_per_ml']
             total_volume = bottle['bottle_volume']
@@ -859,7 +820,6 @@ def calculate_volume():
 def save_photo():
     """Сохранение фотографии бутылки с метаданными"""
     try:
-        # Проверка наличия файла
         if 'file' not in request.files:
             raise ValueError("Не предоставлен файл изображения")
             
@@ -867,12 +827,10 @@ def save_photo():
         if file.filename == '':
             raise ValueError("Пустой файл")
         
-        # Получение параметров
         brand = request.form.get('brand', '').strip()
         if not brand:
             raise ValueError("Не указан бренд")
         
-        # Валидация объемов
         try:
             bottle_volume = float(request.form.get('bottle_volume', '0'))
             remaining_volume = float(request.form.get('remaining_volume', '0'))
@@ -881,7 +839,6 @@ def save_photo():
         except ValueError:
             raise ValueError("Неверный формат объема")
 
-        # Сохранение фото
         saved_path = PhotoManager.save_brand_photo(
             file=file,
             brand=brand,
@@ -911,27 +868,20 @@ def list_photos(brand):
         if not os.path.exists(brand_dir):
             return jsonify({"photos": [], "count": 0})
         
-        # Получение списка фото с дополнительной информацией
         photos = []
-        for filename in sorted(os.listdir(brand_dir), reverse=True):  # Сортировка по новизне
+        for filename in sorted(os.listdir(brand_dir), reverse=True):
             file_path = brand_dir / filename
             if os.path.isfile(file_path):
-                # Парсинг информации из имени файла
-                parts = filename.split('_')
                 try:
-                    date_str = parts[0]
-                    time_str = parts[1]
-                    volume_str = parts[3]
-                    remaining_str = parts[5]
-                    
+                    parts = filename.split('_')
                     photos.append({
                         "filename": filename,
                         "path": str(file_path),
                         "size": os.path.getsize(file_path),
-                        "date": f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}",
-                        "time": f"{time_str[:2]}:{time_str[2:4]}:{time_str[4:6]}",
-                        "volume_ml": int(volume_str.replace('ml', '')),
-                        "remaining_ml": int(remaining_str.replace('ml', ''))
+                        "date": f"{parts[0][:4]}-{parts[0][4:6]}-{parts[0][6:8]}",
+                        "time": f"{parts[1][:2]}:{parts[1][2:4]}:{parts[1][4:6]}",
+                        "volume_ml": int(parts[3].replace('ml', '')),
+                        "remaining_ml": int(parts[5].replace('ml', ''))
                     })
                 except Exception as e:
                     logger.warning(f"Не удалось разобрать имя файла {filename}: {e}")
@@ -967,7 +917,7 @@ if __name__ == '__main__':
         # Создаем необходимые папки
         ensure_class_folders()
         
-        # Инициализируем менеджер моделей (предзагрузка всех моделей)
+        # Инициализируем менеджер моделей (с загрузкой моделей)
         app.model_manager = ModelManager()
         
         # Логируем информацию о загруженных данных
@@ -978,15 +928,17 @@ if __name__ == '__main__':
         logger.info(f"Загружено {len(app.model_manager.models)} моделей ИИ")
         
         # Проверка доступности всех ожидаемых моделей
-        expected_models = ['gin', 'vodka', 'whiskey']  # Добавьте нужные типы
+        expected_models = ['gin', 'vodka', 'whiskey']
         for model in expected_models:
             if model not in app.model_manager.models:
                 logger.warning(f"Ожидаемая модель {model} не загружена!")
         
-        logger.info("Запуск HTTP сервера на порту 5000")
+        # Запуск сервера с портом из переменных окружения
+        port = int(os.environ.get("PORT", 5000))
+        logger.info(f"Запуск HTTP сервера на порту {port}")
         app.run(
             host='0.0.0.0',
-            port=5000,
+            port=port,
             debug=False,
             threaded=True
         )
